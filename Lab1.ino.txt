@@ -1,0 +1,267 @@
+/*EECE.5520 Spring 2022: Lab 1: Traffic Light Controller
+  Group Members:
+  Federico Rocha Munoz
+  Ernie Pellegrino
+  Andrew Sgroi
+*/
+
+//Define the states of the machine for Switch-Case Code
+#define R0  0
+#define R   1
+#define G   2
+#define Y1  3
+#define Y2  4
+
+//Define Output pins which connect to the LED's, buzzer, & button
+#define button  2	// push button
+#define sigG    3	// green LED & 220 ohm resistor
+#define sigY    4	// yellow LED & 220 ohm resistor
+#define sigR    5	// red LED & 220 ohm resistor
+#define buzzer  6	// buzzer
+
+//Define Output pins going to the digital display
+//int LED_digit_1 = CHOOSE A DIGITAL PIN ON Arduino;   //1st Digit from the left on 7-segment display
+//int LED_digit_2 = CHOOSE A DIGITAL PIN ON Arduino;   //2nd Digit from the left on 7-segment display
+int LED_digit_3 = 8;   //3rd Digit from the left on 7-segment display
+int LED_digit_4 = 9;   //4th Digit from the left on 7-segment display
+
+//Define Output pins going to the 74HC595 chip, the 2-stage serial-to-parallel shift-register
+int clockPin = 11;	// connected to the SH_CP of 74HC595
+int latchPin = 12;	// connected to the ST_CP of 74HC59
+int dataPin = 13;	  // connected to the DS of 74HC595 //signal line for hexcode encoding which bars to light
+
+uint8_t fsm_state = R0; //Initial state of state machine
+unsigned int reload = 0xF424; // Value equivalent to to 1 second
+
+//LUT for the individual digits
+byte seven_seg_digits[16] = {
+  B11111100, // = 0
+  B01100000, // = 1
+  B11011010, // = 2
+  B11110010, // = 3
+  B01100110, // = 4
+  B10110110, // = 5
+  B10111110, // = 6
+  B11100000, // = 7
+  B11111110, // = 8
+  B11100110, // = 9
+  B11101110, // A
+  B00111110, // b, lowercase to be seperate from 8
+  B10011100, // C
+  B01111010, // d, lowercase to be seperate from 0
+  B10011110, // E
+  B10001110, // F
+}; //end of arrary defining which bars to light for a given hex number on the digital display
+
+void setup()
+{
+  //Initialize the button as input meanwhile the LEDs & buzzer pins as outputs
+  pinMode(button  , INPUT_PULLUP);
+  pinMode(sigG  , OUTPUT);
+  pinMode(sigY  , OUTPUT);
+  pinMode(sigR  , OUTPUT);
+  pinMode(buzzer  , OUTPUT);
+
+  //Initialize the latch(SH_CP), clock(ST_CP), and data(DS) pins of the 74HC595 chip as outputs
+  pinMode(clockPin, OUTPUT);
+  pinMode(latchPin, OUTPUT);
+  pinMode(dataPin, OUTPUT);
+
+  //Initialize the 7-segment display pins which control the 3rd and 4th digit on the screen as outputs
+  pinMode(LED_digit_3, OUTPUT);
+  pinMode(LED_digit_4, OUTPUT);
+
+  //Display is active LOW, set them HIGH to start with the screen off
+  digitalWrite(LED_digit_3, HIGH);
+  digitalWrite(LED_digit_4, HIGH);
+
+  //Setup registers for interrupts
+  TCCR1A = 0;
+  TCCR1B = 0;
+  OCR1A = reload;
+  TCCR1B = (1 << WGM12) | (1 << CS12);
+  TIMSK1 = (1 << OCIE1A);
+
+}
+
+//Define Variables
+volatile int count = 0; //timing variable for counting seconds spent remaining in a given state
+int max_count_value = 20;
+int buzz_time = 3;
+int change_time = 0;
+int blink_red_flag = 0;
+int blink_yellow_flag = 0;
+
+
+ISR(TIMER1_COMPA_vect) // ISR = Interrupt Service Routine
+{
+  count -= 1;
+  //delay(5000);
+   //toggle Red LED off it was turned off. Toggle-on occurs in switch_initial state
+  if (blink_red_flag == 1) {
+    blink_red_flag = 0;
+  }
+  else {
+    blink_red_flag = 1;
+  }
+}
+
+// This function groups displays a hex# on the digital segment display
+/*  My wire colors:               gt,wh,Br, R, O,yt, Y, G
+    74HC595 pin name:             Q0,Q1,Q2,Q3,Q4,Q5,Q6,Q7
+    74HC595 pin #:                15, 1, 2, 3, 4, 5, 6, 7
+    Which maps to these:
+   7-segement LED display BARS:    A, B, C, D, E, F, G, D1
+   7-segement LED display PIN#s:  11, 7, 4, 2, 1,10, 5, 3
+   
+   7-segement LED display Digit:  1, 2, 3, 4
+   7-segement LED display PIN#s: 12, 9, 8, 6 // we are using 3rd & 4th digit so LED-pins 8 & 6 respectively
+    <==A==>
+   /\     /\
+   |F|    |B|
+   \/     \/
+    <==G==>
+   /\     /\
+   |E|    |C|
+   \/     \/  (D1)
+    <==D==>        */
+
+// This function takes a hex-value encoded to light up correspondg bars on LED 7-segment display
+void sevenSegWrite(byte hex_value) {
+  // set the latchPin to low potential, before sending data
+  digitalWrite(latchPin, LOW);
+
+  // the original data (bit pattern)
+  shiftOut(dataPin, clockPin, LSBFIRST, seven_seg_digits[hex_value]);
+
+  // set the latchPin to high potential, after sending data
+  digitalWrite(latchPin, HIGH);
+} //end of function which lights up bars LED display
+
+// tell this function WHICH of the 4 digits on the LED-display you want to use & feed it a hexcode, VALUE, indicating which bars to light up
+void one_digit(int which, byte value) {
+  digitalWrite(which, LOW);
+  sevenSegWrite(value);
+  //delay(1);
+  digitalWrite(which, HIGH);
+}
+
+// pass a value(max 255,0xFF) to display on LED-display, with value persisting on display for one second (length of for-loop counter)
+void two_digit_display(byte value) {
+
+  //cleave left digit (sixteens-place) from value & store in digit0 for future use
+  int digit0 = value - (value / 16) * 16;
+
+  //cleave right digit (ones-place) from value & store in digit1 for future use
+  int digit1 = (value - digit0) / 16;
+
+  //display values stored in digit0 & digit1 on LCD
+  for (int i = 0; i < 50; i++) {
+    one_digit(LED_digit_3, digit0);
+    one_digit(LED_digit_4, digit1);
+  }
+}
+// End of function-group responsible for display hex#'s on LED-display
+
+void loop() {
+
+  //state machine
+  switch (fsm_state)
+  {
+    default:
+      //fsm_state = R0;
+      break;
+
+    case R0:
+    //look for button-press to break out of initial state self-looping
+      if (digitalRead(button) == LOW) { //low bc we set button as internal pull-up
+        fsm_state = R;
+        count = max_count_value;
+      }
+      else {
+        fsm_state = R0;
+        count = 1;
+        //While in Initail state toggle blink_red_flag with the ISR routine to blink red LED
+        if (blink_red_flag == 1) {
+          digitalWrite(sigR, HIGH);
+        }
+        else {
+          digitalWrite(sigR, LOW);
+        }
+      }
+      break; //End of Blink Red
+
+    case R:
+      digitalWrite(sigG, LOW);
+      digitalWrite(sigY, LOW);
+      digitalWrite(sigR, HIGH);
+      digitalWrite(buzzer, LOW);
+      if (count <= change_time) {
+        count = max_count_value;
+        fsm_state = G;
+      }
+      else {
+        fsm_state = R;
+      }
+      break; //End of Red
+
+    case G:
+      digitalWrite(sigG, HIGH);
+      digitalWrite(sigY, LOW);
+      digitalWrite(sigR, LOW);
+      digitalWrite(buzzer, LOW);
+      if (count <= change_time) {
+        count = 6; //yellow countdown is 6 seconds as per Lab instructions
+        fsm_state = Y1;
+      }
+      else {
+        fsm_state = G;
+      }
+      break; //End of Green
+
+    case Y1:
+      digitalWrite(sigG, LOW);
+      digitalWrite(sigY, HIGH);
+      digitalWrite(sigR, LOW);
+      digitalWrite(buzzer, LOW);
+      if (count == buzz_time) { //Transition to blinking yellow occurs at buzzer time
+        fsm_state = Y2;
+      }
+      else {
+        fsm_state = Y1;
+      }
+      break;//End of Yellow 1
+
+    case Y2:
+      digitalWrite(sigG, LOW);
+      digitalWrite(sigR, LOW);
+      //digitalWrite(buzzer,LOW); //leave buzzer on for duration of blinking yellow to match R & G states having buzzer on till color change
+      if (blink_yellow_flag <= 4) {
+        digitalWrite(sigY, LOW);
+      }
+      else if (blink_yellow_flag >= 8) {
+        digitalWrite(sigY, HIGH);
+        blink_yellow_flag = 0;
+      }
+      blink_yellow_flag += 1;
+      fsm_state = Y2; //Repeat blinking yellow state until count reaches 0
+
+      if (count <= change_time) {
+        count = max_count_value;
+        fsm_state = R;
+      }
+      break;//End of Yellow 2
+
+  } //End of Switch-Code
+
+  //Buzzer logic: ring buzzer at buzz time as long as we are not in initial state
+  if (count <= buzz_time and fsm_state != R0) {
+    digitalWrite(buzzer, HIGH);
+    delay(1);
+    digitalWrite(buzzer, LOW);
+  }
+
+  //Update the LED-display every cycle
+  two_digit_display(count - 1); //count - 1 because we want to show 0
+
+} //End of loop()
